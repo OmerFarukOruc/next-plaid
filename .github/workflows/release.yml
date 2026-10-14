@@ -237,8 +237,8 @@ jobs:
         with:
           name: artifacts-migraphx-runtime
           path: |
-            target/distrib/onnxruntime-linux-x64-migraphx-1.23.1-rocm7.1.1.tgz
-            target/distrib/onnxruntime-linux-x64-migraphx-1.23.1-rocm7.1.1.tgz.sha256
+            target/distrib/onnxruntime-linux-x64-migraphx-1.23.1-rocm7.1.1-r4.tgz
+            target/distrib/onnxruntime-linux-x64-migraphx-1.23.1-rocm7.1.1-r4.tgz.sha256
           if-no-files-found: error
 
   # Build and package all the platform-agnostic(ish) things

@@ -7,9 +7,9 @@ set -euo pipefail
 ORT_VERSION=1.23.1
 ORT_COMMIT=d9b2048791efb5804fe3d53a04b4971256addebf
 ROCM_VERSION=7.1.1
-NAME="onnxruntime-linux-x64-migraphx-${ORT_VERSION}-rocm${ROCM_VERSION}"
+NAME="onnxruntime-linux-x64-migraphx-${ORT_VERSION}-rocm${ROCM_VERSION}-r4"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-PATCH="$SCRIPT_DIR/ort-migraphx-lifetime.patch"
+PATCHES=("$SCRIPT_DIR/ort-migraphx-lifetime.patch" "$SCRIPT_DIR/ort-migraphx-cache.patch" "$SCRIPT_DIR/ort-migraphx-integer.patch")
 
 if [[ $# -lt 3 || $# -gt 4 ]]; then
   echo "Usage: $0 <work-dir> <out-dir> <rocm-prefix> [jobs]" >&2
@@ -41,8 +41,10 @@ git -C "$SOURCE" fetch --depth 1 https://github.com/microsoft/onnxruntime.git "$
 git -C "$SOURCE" checkout -q --detach FETCH_HEAD
 [[ $(git -C "$SOURCE" rev-parse HEAD) == "$ORT_COMMIT" ]]
 git -C "$SOURCE" submodule update --init --recursive --depth 1
-git -C "$SOURCE" apply --check "$PATCH"
-git -C "$SOURCE" apply "$PATCH"
+for PATCH in "${PATCHES[@]}"; do
+  git -C "$SOURCE" apply --check "$PATCH"
+  git -C "$SOURCE" apply "$PATCH"
+done
 EPOCH=$(git -C "$SOURCE" show -s --format=%ct HEAD)
 export SOURCE_DATE_EPOCH="$EPOCH"
 
@@ -64,11 +66,13 @@ for LIB in "libonnxruntime.so.$ORT_VERSION" libonnxruntime_providers_shared.so l
   cp -L "$BUILD/build/Release/$LIB" "$PACKAGE/lib/$LIB"
 done
 cp "$SOURCE/LICENSE" "$SOURCE/ThirdPartyNotices.txt" "$PACKAGE/"
-cp "$PATCH" "$PACKAGE/ort-migraphx-lifetime.patch"
+for PATCH in "${PATCHES[@]}"; do
+  cp "$PATCH" "$PACKAGE/$(basename "$PATCH")"
+done
 cat > "$PACKAGE/SOURCE.txt" <<EOF
 ONNX Runtime $ORT_VERSION from https://github.com/microsoft/onnxruntime
 Source revision: $ORT_COMMIT
-Applied modification: ort-migraphx-lifetime.patch (included in this archive)
+Applied modifications: ort-migraphx-lifetime.patch, ort-migraphx-cache.patch, ort-migraphx-integer.patch (included in this archive)
 ROCm build version: $ROCM_VERSION
 EOF
 tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$EPOCH" \

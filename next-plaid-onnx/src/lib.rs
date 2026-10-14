@@ -218,15 +218,18 @@ impl std::fmt::Display for ExecutionProvider {
 fn configure_execution_provider(
     builder: SessionBuilder,
     provider: ExecutionProvider,
+    quantized: bool,
 ) -> Result<SessionBuilder> {
     match provider {
-        ExecutionProvider::Auto => configure_auto_provider(builder),
+        ExecutionProvider::Auto => {
+            configure_auto_provider(builder, quantized).map(|(builder, _)| builder)
+        }
         ExecutionProvider::Cpu => Ok(builder),
         ExecutionProvider::Cuda => configure_cuda(builder),
         ExecutionProvider::TensorRT => configure_tensorrt(builder),
         ExecutionProvider::CoreML => configure_coreml(builder),
         ExecutionProvider::DirectML => configure_directml(builder),
-        ExecutionProvider::MIGraphX => configure_migraphx(builder),
+        ExecutionProvider::MIGraphX => configure_migraphx(builder, quantized),
     }
 }
 
@@ -320,7 +323,7 @@ pub fn is_cuda_available() -> bool {
 pub fn validate_execution_provider(provider: ExecutionProvider) -> Result<()> {
     init_ort_runtime();
     let builder = Session::builder().context("Failed to create ONNX session options")?;
-    configure_execution_provider(builder, provider)?;
+    configure_execution_provider(builder, provider, false)?;
     Ok(())
 }
 
@@ -352,9 +355,13 @@ pub fn is_migraphx_available() -> bool {
     false
 }
 
-fn configure_auto_provider(builder: SessionBuilder) -> Result<SessionBuilder> {
+#[allow(unused_variables)]
+fn configure_auto_provider(
+    builder: SessionBuilder,
+    quantized: bool,
+) -> Result<(SessionBuilder, ExecutionProvider)> {
     if is_force_cpu() {
-        return Ok(builder);
+        return Ok((builder, ExecutionProvider::Cpu));
     }
     #[allow(unused_mut)]
     let mut errors: Vec<String> = Vec::new();
@@ -369,40 +376,52 @@ fn configure_auto_provider(builder: SessionBuilder) -> Result<SessionBuilder> {
                     .build()
                     .error_on_failure()])
         })) {
-            Ok(Ok(b)) => return Ok(b),
+            Ok(Ok(b)) => return Ok((b, ExecutionProvider::Cuda)),
             Ok(Err(e)) => errors.push(format!("CUDA: {e}")),
             Err(_) => errors.push("CUDA: invalid or incomplete driver library".into()),
         }
     }
     #[allow(unused_macros)]
     macro_rules! attempt {
-        ($ep:expr, $name:expr) => {
+        ($ep:expr, $name:expr, $provider:expr) => {
             match builder
                 .clone()
                 .with_execution_providers([$ep.error_on_failure()])
             {
-                Ok(b) => return Ok(b),
+                Ok(b) => return Ok((b, $provider)),
                 Err(e) => errors.push(format!("{}: {e}", $name)),
             }
         };
     }
     #[cfg(feature = "tensorrt")]
-    attempt!(TensorRTExecutionProvider::default().build(), "TensorRT");
+    attempt!(
+        TensorRTExecutionProvider::default().build(),
+        "TensorRT",
+        ExecutionProvider::TensorRT
+    );
     #[cfg(feature = "coreml")]
-    attempt!(coreml_execution_provider(), "CoreML");
+    attempt!(
+        coreml_execution_provider(),
+        "CoreML",
+        ExecutionProvider::CoreML
+    );
     #[cfg(feature = "directml")]
-    attempt!(DirectMLExecutionProvider::default().build(), "DirectML");
+    attempt!(
+        DirectMLExecutionProvider::default().build(),
+        "DirectML",
+        ExecutionProvider::DirectML
+    );
     #[cfg(feature = "migraphx")]
     if is_migraphx_available() {
-        match configure_migraphx(builder.clone()) {
-            Ok(b) => return Ok(b),
+        match configure_migraphx(builder.clone(), quantized) {
+            Ok(b) => return Ok((b, ExecutionProvider::MIGraphX)),
             Err(error) => errors.push(format!("MIGraphX: {error:#}")),
         }
     }
     if is_force_gpu() {
         anyhow::bail!("No GPU execution provider could be registered. Ensure the GPU runtime and its dependencies are installed. {}", errors.join("; "));
     }
-    Ok(builder)
+    Ok((builder, ExecutionProvider::Cpu))
 }
 
 #[cfg(feature = "cuda")]
@@ -543,34 +562,115 @@ fn configure_directml(_builder: SessionBuilder) -> Result<SessionBuilder> {
 }
 
 #[cfg(feature = "migraphx")]
-fn configure_migraphx(mut builder: SessionBuilder) -> Result<SessionBuilder> {
+fn migraphx_cache_path(
+    explicit: Option<std::ffi::OsString>,
+    xdg: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<std::path::PathBuf> {
+    match explicit {
+        Some(path) if path.is_empty() => None,
+        Some(path) => Some(std::path::PathBuf::from(path)),
+        None => {
+            let base = xdg
+                .map(std::path::PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .or_else(|| home.map(|home| std::path::PathBuf::from(home).join(".cache")))?;
+            Some(base.join("next-plaid").join("migraphx"))
+        }
+    }
+}
+
+#[cfg(feature = "migraphx")]
+fn migraphx_cache_directory() -> Option<std::ffi::CString> {
+    let path = migraphx_cache_path(
+        std::env::var_os("NEXT_PLAID_MIGRAPHX_CACHE_DIR"),
+        std::env::var_os("XDG_CACHE_HOME"),
+        std::env::var_os("HOME"),
+    )?;
+    if let Err(error) = std::fs::create_dir_all(&path) {
+        eprintln!("MIGraphX compiled cache unavailable; continuing uncached: {error}");
+        return None;
+    }
+    match std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) {
+        Ok(path) => Some(path),
+        Err(error) => {
+            eprintln!("MIGraphX compiled cache path invalid; continuing uncached: {error}");
+            None
+        }
+    }
+}
+
+#[cfg(feature = "migraphx")]
+fn configure_migraphx(mut builder: SessionBuilder, quantized: bool) -> Result<SessionBuilder> {
     use ort::AsPointer;
     if is_force_cpu() {
         return Ok(builder);
     }
     // ORT 1.23 changed the legacy OrtMIGraphXProviderOptions layout. ort rc.11
     // still uses the old layout, so register through the stable generic API.
-    // Omitting legacy options also avoids serializing an empty cache path as `""`.
+    // The versioned cache option is supported only by runtimes that key compiled
+    // models by their graph, input shapes, device and compilation settings.
     // https://github.com/microsoft/onnxruntime/blob/v1.23.1/onnxruntime/core/session/provider_registration.cc
-    let status = unsafe {
-        (ort::api().SessionOptionsAppendExecutionProvider)(
-            builder.ptr_mut(),
-            c"MIGraphX".as_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-            0,
-        )
+    let cache_path = migraphx_cache_directory();
+    let register = |builder: &mut SessionBuilder, with_cache: bool| {
+        let mut keys = Vec::with_capacity(2);
+        let mut values = Vec::with_capacity(2);
+        // A runtime without the integer zero-point fix can load successfully
+        // but return incorrect INT8 embeddings. This capability is mandatory,
+        // independently of the optional compiled-model cache.
+        if quantized {
+            keys.push(c"migraphx_int8_zero_point_fix_v1".as_ptr());
+            values.push(c"1".as_ptr());
+        }
+        if with_cache {
+            keys.push(c"migraphx_model_cache_dir_v2".as_ptr());
+            values.push(cache_path.as_ref().unwrap().as_ptr());
+        }
+        let status = unsafe {
+            (ort::api().SessionOptionsAppendExecutionProvider)(
+                builder.ptr_mut(),
+                c"MIGraphX".as_ptr(),
+                if keys.is_empty() {
+                    std::ptr::null()
+                } else {
+                    keys.as_ptr()
+                },
+                if values.is_empty() {
+                    std::ptr::null()
+                } else {
+                    values.as_ptr()
+                },
+                keys.len(),
+            )
+        };
+        unsafe { ort::error::status_to_result(status) }
+    };
+    let result = match register(&mut builder, cache_path.is_some()) {
+        Err(error)
+            if cache_path.is_some()
+                && error
+                    .message()
+                    .contains("Unknown provider option: \"migraphx_model_cache_dir_v2\".") =>
+        {
+            // Parsing rejects unknown options before appending a provider.
+            // Retry without only the optional cache key; INT8 still requires
+            // the correctness capability, including on stock runtimes.
+            register(&mut builder, false)
+        }
+        result => result,
     };
     // Always propagate registration failure; ORT's best-effort EP dispatch
     // would otherwise silently accept a CPU session after a failed GPU load.
-    unsafe { ort::error::status_to_result(status) }.context(
-        "Failed to configure MIGraphX execution provider. Ensure ROCm and MIGraphX are installed.",
-    )?;
+    result.context(if quantized {
+        "Failed to configure INT8 MIGraphX execution provider. Use the current managed runtime with the integer correctness fix, run colgrep settings --fp32, or use --force-cpu."
+    } else {
+        "Failed to configure MIGraphX execution provider. Ensure ROCm and MIGraphX are installed."
+    })?;
     Ok(builder)
 }
 
 #[cfg(not(feature = "migraphx"))]
-fn configure_migraphx(_builder: SessionBuilder) -> Result<SessionBuilder> {
+fn configure_migraphx(_builder: SessionBuilder, _quantized: bool) -> Result<SessionBuilder> {
     anyhow::bail!("MIGraphX support not compiled. Enable the 'migraphx' feature.")
 }
 
@@ -789,12 +889,14 @@ pub struct Colbert {
     skiplist_ids: Arc<HashSet<u32>>,
     next_session_idx: Arc<AtomicUsize>,
     pub requested_execution_provider: ExecutionProvider,
+    resolved_execution_provider: ExecutionProvider,
     batch_size: usize,
     dynamic_batch: bool,
 }
 
 pub struct PreparedDocumentBatch {
     batch_size: usize,
+    tensor_rows: usize,
     batch_max_len: usize,
     all_input_ids: Vec<i64>,
     all_attention_mask: Vec<i64>,
@@ -818,6 +920,20 @@ struct TokenizedDocument {
 }
 
 impl PreparedDocumentBatch {
+    fn pad_tensor_rows(&mut self, target_rows: usize) {
+        // Duplicate a valid row rather than an all-masked row: some attention
+        // implementations produce NaNs for empty rows. Outputs stay logical.
+        while self.tensor_rows < target_rows {
+            self.all_input_ids.extend_from_within(..self.batch_max_len);
+            self.all_attention_mask
+                .extend_from_within(..self.batch_max_len);
+            if let Some(type_ids) = &mut self.all_token_type_ids {
+                type_ids.extend_from_within(..self.batch_max_len);
+            }
+            self.tensor_rows += 1;
+        }
+    }
+
     pub fn batch_size(&self) -> usize {
         self.batch_size
     }
@@ -1071,6 +1187,7 @@ impl ColbertBuilder {
         };
 
         let mut sessions = Vec::with_capacity(self.num_sessions);
+        let mut resolved_execution_provider = self.execution_provider;
         for _i in 0..self.num_sessions {
             let builder = Session::builder()
                 .map_err(|e| anyhow::anyhow!("Failed to create ONNX session builder: {e:?}"))?
@@ -1088,7 +1205,19 @@ impl ColbertBuilder {
                 .with_memory_pattern(false)
                 .map_err(|e| anyhow::anyhow!("Failed to configure ONNX memory pattern: {e:?}"))?;
 
-            let builder = configure_execution_provider(builder, self.execution_provider)?;
+            let (builder, provider) = if self.execution_provider == ExecutionProvider::Auto {
+                configure_auto_provider(builder, self.quantized)?
+            } else {
+                (
+                    configure_execution_provider(builder, self.execution_provider, self.quantized)?,
+                    if is_force_cpu() {
+                        ExecutionProvider::Cpu
+                    } else {
+                        self.execution_provider
+                    },
+                )
+            };
+            resolved_execution_provider = provider;
 
             let profile_prefix = std::env::var_os("NEXT_PLAID_ORT_PROFILE");
             let builder = if let Some(prefix) = &profile_prefix {
@@ -1130,6 +1259,7 @@ impl ColbertBuilder {
             skiplist_ids: Arc::new(skiplist_ids),
             next_session_idx: Arc::new(AtomicUsize::new(0)),
             requested_execution_provider: self.execution_provider,
+            resolved_execution_provider,
             batch_size,
             dynamic_batch: self.dynamic_batch,
         })
@@ -1301,7 +1431,12 @@ impl Colbert {
 
         let mut batches = Vec::new();
         for (shape, bucket_docs) in shapes.iter().zip(buckets) {
-            let docs_per_batch = shape.docs.max(1);
+            let stable_migraphx = self.resolved_execution_provider == ExecutionProvider::MIGraphX;
+            let docs_per_batch = if stable_migraphx {
+                shape.docs.min(self.batch_size.max(1)).max(1)
+            } else {
+                shape.docs.max(1)
+            };
             let mut bucket_iter = bucket_docs.into_iter();
             while let Some((first_idx, first)) = bucket_iter.next() {
                 let mut piece_encodings = Vec::with_capacity(docs_per_batch);
@@ -1312,7 +1447,7 @@ impl Colbert {
                     piece_encodings.push(encoding);
                     piece_indices.push(idx);
                 }
-                batches.push(prepare_batch_from_tokenized_documents(
+                let mut batch = prepare_batch_from_tokenized_documents(
                     &self.tokenizer,
                     &self.config,
                     piece_encodings,
@@ -1320,7 +1455,11 @@ impl Colbert {
                     true,
                     piece_indices,
                     Some(shape.planned_len),
-                )?);
+                )?;
+                if stable_migraphx {
+                    batch.pad_tensor_rows(docs_per_batch);
+                }
+                batches.push(batch);
             }
         }
 
@@ -2051,6 +2190,7 @@ fn prepare_batch_for_session(
     if texts.is_empty() {
         return Ok(PreparedDocumentBatch {
             batch_size: 0,
+            tensor_rows: 0,
             batch_max_len: 0,
             all_input_ids: Vec::new(),
             all_attention_mask: Vec::new(),
@@ -2191,6 +2331,7 @@ fn prepare_batch_from_tokenized_documents(
 
     Ok(PreparedDocumentBatch {
         batch_size,
+        tensor_rows: batch_size,
         batch_max_len,
         all_input_ids,
         all_attention_mask,
@@ -2335,6 +2476,7 @@ fn prepare_batch_from_tokenizer_encodings(
 
     Ok(PreparedDocumentBatch {
         batch_size,
+        tensor_rows: batch_size,
         batch_max_len,
         all_input_ids,
         all_attention_mask,
@@ -2362,6 +2504,7 @@ fn encode_prepared_batch_with_session(
 ) -> Result<Vec<Array2<f32>>> {
     let PreparedDocumentBatch {
         batch_size,
+        tensor_rows,
         batch_max_len,
         all_input_ids,
         all_attention_mask,
@@ -2377,12 +2520,12 @@ fn encode_prepared_batch_with_session(
         return Ok(Vec::new());
     }
 
-    let input_ids_tensor = Tensor::from_array(([batch_size, batch_max_len], all_input_ids))?;
+    let input_ids_tensor = Tensor::from_array(([tensor_rows, batch_max_len], all_input_ids))?;
     let attention_mask_tensor =
-        Tensor::from_array(([batch_size, batch_max_len], all_attention_mask))?;
+        Tensor::from_array(([tensor_rows, batch_max_len], all_attention_mask))?;
 
     let token_type_ids_tensor = all_token_type_ids
-        .map(|ids| Tensor::from_array(([batch_size, batch_max_len], ids)))
+        .map(|ids| Tensor::from_array(([tensor_rows, batch_max_len], ids)))
         .transpose()?;
 
     let (shape_slice, output_owned): (Vec<i64>, Vec<f32>) =
@@ -2544,7 +2687,7 @@ mod tests {
     fn forced_migraphx_rejects_cpu_runtime() {
         std::env::set_var("NEXT_PLAID_FORCE_GPU", "1");
         init_ort_runtime();
-        let result = configure_migraphx(Session::builder().unwrap());
+        let result = configure_migraphx(Session::builder().unwrap(), false);
         assert!(
             result.is_err(),
             "forced MIGraphX accepted a CPU-only runtime"
@@ -2566,6 +2709,387 @@ mod tests {
             .encode_documents(&["fn main() { println!(\"hello\"); }"], None)
             .unwrap();
         assert!(!embeddings.is_empty());
+    }
+
+    fn tokenizer_only_colbert(provider: ExecutionProvider, dynamic_batch: bool) -> Colbert {
+        use tokenizers::models::wordlevel::WordLevel;
+        let vocab = [
+            ("[PAD]", 0),
+            ("[UNK]", 1),
+            ("[CLS]", 2),
+            ("[SEP]", 3),
+            ("[D]", 4),
+            ("word", 6),
+        ]
+        .into_iter()
+        .map(|(word, id)| (word.to_owned(), id))
+        .collect();
+        let mut tokenizer = Tokenizer::new(
+            WordLevel::builder()
+                .vocab(vocab)
+                .unk_token("[UNK]".to_owned())
+                .build()
+                .unwrap(),
+        );
+        tokenizer.with_pre_tokenizer(Some(
+            tokenizers::pre_tokenizers::whitespace::WhitespaceSplit,
+        ));
+        tokenizer.with_post_processor(Some(tokenizers::processors::bert::BertProcessing::new(
+            ("[SEP]".to_owned(), 3),
+            ("[CLS]".to_owned(), 2),
+        )));
+        let config = ColbertConfig {
+            document_length: 256,
+            document_prefix_id: Some(4),
+            pad_token_id: 0,
+            ..ColbertConfig::default()
+        };
+        Colbert {
+            sessions: Vec::new(),
+            tokenizer: Arc::new(tokenizer),
+            config: Arc::new(config),
+            skiplist_ids: Arc::new(HashSet::new()),
+            next_session_idx: Arc::new(AtomicUsize::new(0)),
+            requested_execution_provider: provider,
+            resolved_execution_provider: provider,
+            batch_size: 4,
+            dynamic_batch,
+        }
+    }
+
+    #[test]
+    fn migraphx_partial_buckets_preserve_shape_and_logical_rows() {
+        let model = tokenizer_only_colbert(ExecutionProvider::MIGraphX, true);
+        for (lengths, expected_order, expected_logical) in [
+            (
+                vec![201, 3, 7, 205, 2, 5, 6, 4, 8, 203],
+                vec![4, 1, 7, 5, 6, 2, 8, 0, 9, 3],
+                vec![4, 3, 3],
+            ),
+            (
+                vec![207, 4, 2, 201, 5, 203, 3, 6, 7],
+                vec![2, 6, 1, 4, 7, 8, 3, 5, 0],
+                vec![4, 2, 3],
+            ),
+        ] {
+            let texts: Vec<String> = lengths
+                .iter()
+                .map(|&len| vec!["word"; len].join(" "))
+                .collect();
+            let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+            let batches = model.tokenize_documents_in_batches(&refs).unwrap();
+            assert_eq!(
+                batches.iter().map(|b| b.batch_size).collect::<Vec<_>>(),
+                expected_logical
+            );
+            assert_eq!(
+                batches
+                    .iter()
+                    .flat_map(|b| b.original_input_indices.iter().copied())
+                    .collect::<Vec<_>>(),
+                expected_order
+            );
+            for batch in batches {
+                assert_eq!(batch.all_input_ids.len() / batch.batch_max_len, 4);
+                assert_eq!(batch.all_attention_mask.len(), batch.all_input_ids.len());
+                assert_eq!(
+                    batch.all_token_type_ids.as_ref().unwrap().len(),
+                    batch.all_input_ids.len()
+                );
+                assert_eq!(batch.all_token_ids.len(), batch.batch_size);
+                assert_eq!(batch.original_lengths.len(), batch.batch_size);
+                for (row, &index) in batch.original_input_indices.iter().enumerate() {
+                    let single = model.tokenize_documents(&[refs[index]]).unwrap();
+                    assert_eq!(batch.all_token_ids[row], single.all_token_ids[0]);
+                    assert_eq!(batch.original_lengths[row], single.original_lengths[0]);
+                    let start = row * batch.batch_max_len;
+                    assert_eq!(
+                        &batch.all_input_ids[start..start + single.batch_max_len],
+                        single.all_input_ids
+                    );
+                    assert_eq!(
+                        &batch.all_attention_mask[start..start + single.batch_max_len],
+                        single.all_attention_mask
+                    );
+                    assert_eq!(
+                        &batch.all_token_type_ids.as_ref().unwrap()
+                            [start..start + single.batch_max_len],
+                        single.all_token_type_ids.as_ref().unwrap()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn other_providers_and_disabled_dynamic_batch_keep_logical_shapes() {
+        let texts: Vec<String> = [201, 3, 7, 205, 2, 5, 6, 4, 8, 203]
+            .iter()
+            .map(|&len| vec!["word"; len].join(" "))
+            .collect();
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        for provider in [
+            ExecutionProvider::Cuda,
+            ExecutionProvider::DirectML,
+            ExecutionProvider::CoreML,
+        ] {
+            let batches = tokenizer_only_colbert(provider, true)
+                .tokenize_documents_in_batches(&refs)
+                .unwrap();
+            assert_eq!(
+                batches.iter().map(|b| b.batch_size).collect::<Vec<_>>(),
+                vec![7, 3]
+            );
+            for b in batches {
+                assert_eq!(b.all_input_ids.len(), b.batch_size * b.batch_max_len);
+            }
+        }
+        for provider in [ExecutionProvider::Cpu, ExecutionProvider::MIGraphX] {
+            let batches = tokenizer_only_colbert(provider, false)
+                .tokenize_documents_in_batches(&refs)
+                .unwrap();
+            assert_eq!(
+                batches.iter().map(|b| b.batch_size).collect::<Vec<_>>(),
+                vec![4, 4, 2]
+            );
+            assert_eq!(
+                batches
+                    .iter()
+                    .flat_map(|b| b.original_input_indices.iter().copied())
+                    .collect::<Vec<_>>(),
+                (0..10).collect::<Vec<_>>()
+            );
+            for b in batches {
+                assert_eq!(b.all_input_ids.len(), b.batch_size * b.batch_max_len);
+            }
+        }
+    }
+
+    #[cfg(feature = "migraphx")]
+    #[test]
+    fn migraphx_cache_ignores_relative_xdg_without_changing_override() {
+        use std::ffi::OsString;
+        use std::path::PathBuf;
+        for xdg in ["relative-cache", ""] {
+            assert_eq!(
+                migraphx_cache_path(
+                    None,
+                    Some(OsString::from(xdg)),
+                    Some(OsString::from("/home/test"))
+                ),
+                Some(PathBuf::from("/home/test/.cache/next-plaid/migraphx"))
+            );
+        }
+        assert_eq!(
+            migraphx_cache_path(None, Some(OsString::from("relative-cache")), None),
+            None
+        );
+        assert_eq!(
+            migraphx_cache_path(
+                None,
+                Some(OsString::from("/tmp/xdg")),
+                Some(OsString::from("/home/test"))
+            ),
+            Some(PathBuf::from("/tmp/xdg/next-plaid/migraphx"))
+        );
+        assert_eq!(
+            migraphx_cache_path(
+                Some(OsString::from("explicit-relative")),
+                Some(OsString::from("/tmp/xdg")),
+                Some(OsString::from("/home/test"))
+            ),
+            Some(PathBuf::from("explicit-relative"))
+        );
+        assert_eq!(
+            migraphx_cache_path(
+                Some(OsString::new()),
+                Some(OsString::from("/tmp/xdg")),
+                Some(OsString::from("/home/test"))
+            ),
+            None
+        );
+    }
+
+    #[cfg(feature = "migraphx")]
+    #[test]
+    #[ignore = "requires old MIGraphX runtime lacking integer capability and NEXT_PLAID_TEST_MODEL containing both ONNX files; registration only"]
+    fn migraphx_int8_rejects_runtime_without_correctness_capability() {
+        let model_dir = std::env::var("NEXT_PLAID_TEST_MODEL").unwrap();
+        let blocked_cache = std::env::var("NEXT_PLAID_TEST_BLOCKED_CACHE").unwrap();
+        std::env::remove_var("NEXT_PLAID_FORCE_CPU");
+        std::env::remove_var("NEXT_PLAID_FORCE_GPU");
+        for cache in ["", blocked_cache.as_str()] {
+            std::env::set_var("NEXT_PLAID_MIGRAPHX_CACHE_DIR", cache);
+            let error = Colbert::builder(&model_dir)
+                .with_execution_provider(ExecutionProvider::MIGraphX)
+                .with_quantized(true)
+                .build()
+                .err()
+                .expect("INT8 MIGraphX accepted a runtime without integer correctness capability");
+            assert!(
+                format!("{error:#}")
+                    .contains("Unknown provider option: \"migraphx_int8_zero_point_fix_v1\"."),
+                "{error:#}"
+            );
+        }
+        std::env::set_var("NEXT_PLAID_MIGRAPHX_CACHE_DIR", "");
+        let fp32 = Colbert::builder(&model_dir)
+            .with_execution_provider(ExecutionProvider::MIGraphX)
+            .with_quantized(false)
+            .build()
+            .unwrap();
+        drop(fp32);
+        let auto = Colbert::builder(&model_dir)
+            .with_execution_provider(ExecutionProvider::Auto)
+            .with_quantized(true)
+            .build()
+            .unwrap();
+        assert_eq!(auto.resolved_execution_provider, ExecutionProvider::Cpu);
+        drop(auto);
+        std::env::set_var("NEXT_PLAID_FORCE_GPU", "1");
+        let error = Colbert::builder(&model_dir)
+            .with_execution_provider(ExecutionProvider::Auto)
+            .with_quantized(true)
+            .build()
+            .err()
+            .expect("forced Auto accepted an incorrect INT8 runtime");
+        assert!(
+            format!("{error:#}")
+                .contains("Unknown provider option: \"migraphx_int8_zero_point_fix_v1\"."),
+            "{error:#}"
+        );
+    }
+
+    #[cfg(feature = "migraphx")]
+    #[test]
+    #[ignore = "requires cache-capable MIGraphX runtime, GPU, NEXT_PLAID_TEST_MODEL and fresh NEXT_PLAID_TEST_MIGRAPHX_CACHE; run separately"]
+    fn migraphx_inference_persists_compiled_cache() {
+        let cache =
+            std::path::PathBuf::from(std::env::var_os("NEXT_PLAID_TEST_MIGRAPHX_CACHE").unwrap());
+        assert!(
+            !cache.exists() || std::fs::read_dir(&cache).unwrap().next().is_none(),
+            "test cache must be absent or empty"
+        );
+        std::env::set_var("NEXT_PLAID_MIGRAPHX_CACHE_DIR", &cache);
+        std::env::set_var("NEXT_PLAID_FORCE_GPU", "1");
+        let model = Colbert::builder(std::env::var("NEXT_PLAID_TEST_MODEL").unwrap())
+            .with_execution_provider(ExecutionProvider::MIGraphX)
+            .with_quantized(true)
+            .with_batch_size(4)
+            .build()
+            .unwrap();
+        let longer =
+            "fn parse(input: &str) -> Result<(), Error> { validate(input)?; Ok(()) } ".repeat(8);
+        let texts = ["fn main() { println!(\"hello\"); }", longer.as_str()];
+        let outputs = model
+            .encode_prepared_document_batches(model.tokenize_documents_in_batches(&texts).unwrap())
+            .unwrap();
+        assert_eq!(outputs.len(), texts.len());
+        assert!(outputs
+            .iter()
+            .all(|output| output.nrows() > 0 && output.iter().all(|v| v.is_finite())));
+        drop(model);
+        assert!(
+            cache.is_dir(),
+            "MIGraphX inference created no compiled cache directory"
+        );
+        let mut pending = vec![cache];
+        let mut compiled_files = Vec::new();
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if entry.file_type().unwrap().is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|extension| extension == "mxr") {
+                    assert!(
+                        entry.metadata().unwrap().len() > 0,
+                        "empty compiled cache file"
+                    );
+                    compiled_files.push(path);
+                }
+            }
+        }
+        assert!(
+            !compiled_files.is_empty(),
+            "MIGraphX inference persisted no compiled cache"
+        );
+        eprintln!("MIGraphX compiled cache files: {compiled_files:?}");
+    }
+
+    #[cfg(feature = "migraphx")]
+    #[test]
+    #[ignore = "requires MIGraphX GPU runtime and NEXT_PLAID_TEST_MODEL; run separately with profiling"]
+    fn migraphx_mixed_batches_match_individual_documents() {
+        let model = Colbert::builder(std::env::var("NEXT_PLAID_TEST_MODEL").unwrap())
+            .with_execution_provider(ExecutionProvider::MIGraphX)
+            .with_quantized(true)
+            .with_batch_size(4)
+            .build()
+            .unwrap();
+        let long = "fn parse_configuration(input: &str) -> Result<(), Error> { validate(input)?; Ok(()) } ".repeat(24);
+        let longer = format!("{} {}", long, "return configuration;".repeat(9));
+        let texts = [
+            long.as_str(),
+            "fn main() {}",
+            "let answer = 42;",
+            longer.as_str(),
+            "use std::collections::HashMap;",
+            "pub struct Settings { enabled: bool }",
+            "return Ok(value);",
+            "let result = parse(input)?;",
+            "impl Default for Settings {}",
+        ];
+        let batches = model.tokenize_documents_in_batches(&texts).unwrap();
+        for batch in &batches {
+            let shapes =
+                build_fixed_dynamic_shapes(4, model.config.document_length, MAX_ATTENTION_ELEMENTS);
+            let shape = shapes
+                .iter()
+                .find(|s| s.planned_len == batch.batch_max_len)
+                .unwrap();
+            assert_eq!(
+                batch.all_input_ids.len() / batch.batch_max_len,
+                shape.docs.min(4)
+            );
+        }
+        let outputs = model.encode_prepared_document_batches(batches).unwrap();
+        assert_eq!(outputs.len(), texts.len());
+        let references: Vec<Array2<f32>> = texts
+            .iter()
+            .map(|text| model.encode_documents(&[*text], None).unwrap().remove(0))
+            .collect();
+        let reference_means: Vec<_> = references
+            .iter()
+            .map(|reference| reference.mean_axis(ndarray::Axis(0)).unwrap())
+            .collect();
+        for (index, output) in outputs.iter().enumerate() {
+            assert_eq!(output.dim(), references[index].dim());
+            assert!(output.iter().all(|v| v.is_finite()));
+            assert!(references[index].iter().all(|v| v.is_finite()));
+            let mean = output.mean_axis(ndarray::Axis(0)).unwrap();
+            let similarities: Vec<f32> = reference_means
+                .iter()
+                .map(|reference| {
+                    let dot: f32 = mean.iter().zip(reference.iter()).map(|(a, b)| a * b).sum();
+                    let mean_norm: f32 = mean.iter().map(|value| value * value).sum();
+                    let reference_norm: f32 = reference.iter().map(|value| value * value).sum();
+                    dot / (mean_norm.sqrt() * reference_norm.sqrt())
+                })
+                .collect();
+            assert!(similarities.iter().all(|v| v.is_finite()));
+            let nearest = similarities
+                .iter()
+                .enumerate()
+                .max_by(|(_, left), (_, right)| left.total_cmp(right))
+                .unwrap()
+                .0;
+            eprintln!("MIGraphX document {index}: cosine similarities {similarities:?}; nearest {nearest}");
+            assert_eq!(
+                nearest, index,
+                "batched document does not match its individual reference"
+            );
+        }
     }
 
     // =========================================================================

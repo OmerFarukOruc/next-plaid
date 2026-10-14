@@ -142,9 +142,38 @@ impl RuntimeBackend {
         match self {
             Self::Cpu => "cpu",
             Self::Cuda | Self::DirectML => "gpu",
-            Self::MIGraphX => "migraphx-rocm7.1.1",
+            Self::MIGraphX => "migraphx-rocm7.1.1-r4",
         }
     }
+}
+
+fn runtime_cache_root_for(home: Option<&Path>, xdg_cache_home: Option<&Path>) -> Option<PathBuf> {
+    xdg_cache_home
+        .filter(|path| path.is_absolute())
+        .map(|path| path.join("colgrep/onnxruntime"))
+        .or_else(|| home.map(|home| home.join(".cache/colgrep/onnxruntime")))
+}
+
+pub(crate) fn runtime_cache_roots_for(
+    home: Option<&Path>,
+    xdg_cache_home: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = runtime_cache_root_for(home, xdg_cache_home)
+        .into_iter()
+        .collect();
+    if let Some(home) = home {
+        let legacy = home.join(".cache/colgrep/onnxruntime");
+        if !roots.contains(&legacy) {
+            roots.push(legacy);
+        }
+    }
+    roots
+}
+
+fn runtime_cache_roots() -> Vec<PathBuf> {
+    let home = dirs::home_dir();
+    let xdg_cache_home = env::var_os("XDG_CACHE_HOME").map(PathBuf::from);
+    runtime_cache_roots_for(home.as_deref(), xdg_cache_home.as_deref())
 }
 
 static RUNTIME_PATH: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
@@ -174,15 +203,10 @@ pub fn prepare_cuda_library_path() -> Result<()> {
                     };
 
                     // Also add the ONNX Runtime GPU directory if we know where it will be
-                    let ort_gpu_dir = dirs::home_dir()
-                        .map(|h| {
-                            h.join(".cache")
-                                .join("colgrep")
-                                .join("onnxruntime")
-                                .join(ORT_VERSION)
-                                .join("gpu")
-                        })
-                        .filter(|p| p.exists());
+                    let ort_gpu_dir = runtime_cache_roots()
+                        .into_iter()
+                        .map(|root| root.join(ORT_VERSION).join("gpu"))
+                        .find(|path| path.exists());
 
                     let final_ld = if let Some(ort_dir) = ort_gpu_dir {
                         let ort_str = ort_dir.to_string_lossy();
@@ -596,16 +620,11 @@ fn find_onnx_runtime() -> Option<PathBuf> {
 fn get_search_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
-    // Home directory for cache
+    let backend = runtime_backend();
+    for root in runtime_cache_roots() {
+        paths.push(root.join(backend.version()).join(backend.cache_subdir()));
+    }
     if let Some(home) = dirs::home_dir() {
-        // Our cache location (new path with cpu/gpu subdirs)
-        paths.push(
-            home.join(".cache")
-                .join("colgrep")
-                .join("onnxruntime")
-                .join(ORT_VERSION)
-                .join(runtime_backend().cache_subdir()),
-        );
         // Legacy cache location (for backwards compatibility)
         paths.push(home.join(".cache").join("onnxruntime").join(ORT_VERSION));
 
@@ -796,25 +815,43 @@ fn publish_runtime_archive(
 
 /// Download ONNX Runtime from GitHub releases
 fn download_onnx_runtime(backend: RuntimeBackend) -> Result<PathBuf> {
-    if backend == RuntimeBackend::Cpu {
-        let root = dirs::home_dir()
-            .context("Could not find home directory")?
-            .join(".cache/colgrep/onnxruntime");
-        if let Some(path) = find_cached_cpu_runtime(&root) {
-            return Ok(path);
+    let roots = runtime_cache_roots();
+    let (url, files) = get_download_info(backend)?;
+    acquire_runtime_from_roots(&roots, backend, &url, &files)
+}
+
+fn acquire_runtime_from_roots(
+    roots: &[PathBuf],
+    backend: RuntimeBackend,
+    url: &str,
+    files: &[FileToExtract],
+) -> Result<PathBuf> {
+    let root = roots.first().context("Could not find home directory")?;
+    for candidate in roots {
+        if backend == RuntimeBackend::Cpu {
+            if let Some(path) = find_cached_cpu_runtime(candidate) {
+                return Ok(path);
+            }
+        } else {
+            let cache = candidate
+                .join(backend.version())
+                .join(backend.cache_subdir());
+            let valid = if backend == RuntimeBackend::MIGraphX {
+                validate_cached_runtime(&cache, files, false)
+            } else {
+                validate_cached_runtime(&cache, files, true)
+            };
+            if valid.is_ok() {
+                return Ok(cache.join(ORT_LIB_NAME));
+            }
         }
     }
-    let cache_dir = dirs::home_dir()
-        .context("Could not find home directory")?
-        .join(".cache/colgrep/onnxruntime")
-        .join(backend.version())
-        .join(backend.cache_subdir());
-    let (url, files) = get_download_info(backend)?;
+    let cache_dir = root.join(backend.version()).join(backend.cache_subdir());
     #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "migraphx"))]
     if backend == RuntimeBackend::MIGraphX {
-        return acquire_migraphx_runtime(&cache_dir, &url);
+        return acquire_migraphx_runtime(&cache_dir, url);
     }
-    acquire_standard_runtime(&cache_dir, &url, &files, backend)
+    acquire_standard_runtime(&cache_dir, url, files, backend)
 }
 
 fn acquire_standard_runtime(
@@ -850,7 +887,7 @@ fn find_cached_cpu_runtime(root: &Path) -> Option<PathBuf> {
     }
     #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "migraphx"))]
     {
-        let cache = root.join("1.23.1").join("migraphx-rocm7.1.1");
+        let cache = root.join("1.23.1").join("migraphx-rocm7.1.1-r4");
         if validate_migraphx_cache(&cache).is_ok() {
             return Some(cache.join(ORT_LIB_NAME));
         }
@@ -859,7 +896,7 @@ fn find_cached_cpu_runtime(root: &Path) -> Option<PathBuf> {
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "migraphx"))]
-const MIGRAPHX_ARCHIVE: &str = "onnxruntime-linux-x64-migraphx-1.23.1-rocm7.1.1";
+const MIGRAPHX_ARCHIVE: &str = "onnxruntime-linux-x64-migraphx-1.23.1-rocm7.1.1-r4";
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "migraphx"))]
 fn migraphx_files() -> Vec<FileToExtract> {
@@ -1269,6 +1306,72 @@ mod migraphx_tests {
 
     #[test]
     #[ignore = "requires real CPU ORT via NEXT_PLAID_TEST_CPU_ORT"]
+    fn xdg_legacy_cpu_and_gpu_core_reuse_offline_without_writes() {
+        use std::os::unix::fs::PermissionsExt;
+        for old_backend in ["cpu", "gpu"] {
+            let fixture = tempfile::tempdir().unwrap();
+            let home = fixture.path().join("home");
+            let xdg = fixture.path().join("xdg");
+            let legacy = home
+                .join(".cache/colgrep/onnxruntime")
+                .join(ORT_VERSION)
+                .join(old_backend);
+            fs::create_dir_all(&legacy).unwrap();
+            fs::copy(
+                env::var("NEXT_PLAID_TEST_CPU_ORT").unwrap(),
+                legacy.join(ORT_LIB_NAME),
+            )
+            .unwrap();
+            fs::set_permissions(&legacy, fs::Permissions::from_mode(0o555)).unwrap();
+            let roots = runtime_cache_roots_for(Some(&home), Some(&xdg));
+            let (_, files) = get_download_info(RuntimeBackend::Cpu).unwrap();
+            let result = acquire_runtime_from_roots(
+                &roots,
+                RuntimeBackend::Cpu,
+                "http://127.0.0.1:9/offline.tgz",
+                &files,
+            );
+            fs::set_permissions(&legacy, fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(result.unwrap(), legacy.join(ORT_LIB_NAME));
+            assert!(!legacy.join(".lock").exists());
+            assert!(!xdg.exists(), "legacy reuse wrote to the primary XDG cache");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires NEXT_PLAID_TEST_ORT_ARCHIVE with the real packaged MIGraphX runtime"]
+    fn xdg_legacy_migraphx_cache_reuse_offline_without_writes() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture.path().join("home");
+        let xdg = fixture.path().join("xdg");
+        let legacy = home
+            .join(".cache/colgrep/onnxruntime")
+            .join(RuntimeBackend::MIGraphX.version())
+            .join(RuntimeBackend::MIGraphX.cache_subdir());
+        fs::create_dir_all(&legacy).unwrap();
+        publish_runtime_archive(
+            &legacy,
+            &fs::read(env::var("NEXT_PLAID_TEST_ORT_ARCHIVE").unwrap()).unwrap(),
+            &migraphx_files(),
+        )
+        .unwrap();
+        fs::set_permissions(&legacy, fs::Permissions::from_mode(0o555)).unwrap();
+        let roots = runtime_cache_roots_for(Some(&home), Some(&xdg));
+        let result = acquire_runtime_from_roots(
+            &roots,
+            RuntimeBackend::MIGraphX,
+            "http://127.0.0.1:9/offline.tgz",
+            &migraphx_files(),
+        );
+        fs::set_permissions(&legacy, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(result.unwrap(), legacy.join(ORT_LIB_NAME));
+        assert!(!legacy.join(".lock").exists());
+        assert!(!xdg.exists(), "legacy reuse wrote to the primary XDG cache");
+    }
+
+    #[test]
+    #[ignore = "requires real CPU ORT via NEXT_PLAID_TEST_CPU_ORT"]
     fn legacy_read_only_cpu_cache_is_available_offline() {
         use std::os::unix::fs::PermissionsExt;
         let cache = tempfile::tempdir().unwrap();
@@ -1531,5 +1634,50 @@ mod migraphx_tests {
         server.join().unwrap();
         assert!(result.is_err());
         assert!(!cache.path().join(ORT_LIB_NAME).exists());
+    }
+}
+
+#[cfg(test)]
+mod cache_location_tests {
+    use super::*;
+
+    #[test]
+    fn absolute_xdg_cache_home_selects_runtime_location() {
+        let cache = Path::new(if cfg!(windows) {
+            r"C:\workspace\cache"
+        } else {
+            "/workspace/cache"
+        });
+        assert_eq!(
+            runtime_cache_root_for(Some(Path::new("/home/user")), Some(cache)),
+            Some(cache.join("colgrep/onnxruntime"))
+        );
+    }
+
+    #[test]
+    fn relative_xdg_cache_home_preserves_legacy_location() {
+        assert_eq!(
+            runtime_cache_root_for(
+                Some(Path::new("/home/user")),
+                Some(Path::new("relative/cache"))
+            ),
+            Some(PathBuf::from("/home/user/.cache/colgrep/onnxruntime"))
+        );
+    }
+
+    #[test]
+    fn empty_xdg_cache_home_preserves_legacy_location() {
+        assert_eq!(
+            runtime_cache_root_for(Some(Path::new("/home/user")), Some(Path::new(""))),
+            Some(PathBuf::from("/home/user/.cache/colgrep/onnxruntime"))
+        );
+    }
+
+    #[test]
+    fn unset_xdg_cache_home_preserves_legacy_location() {
+        assert_eq!(
+            runtime_cache_root_for(Some(Path::new("/home/user")), None),
+            Some(PathBuf::from("/home/user/.cache/colgrep/onnxruntime"))
+        );
     }
 }

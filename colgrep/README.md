@@ -993,7 +993,8 @@ Advice for running on a CUDA 13 host:
 The Linux x86_64 release supports MIGraphX with ROCm 7.1.1. Install the ROCm and
 MIGraphX runtime packages for your distribution and expose their libraries to the
 dynamic linker. Colgrep downloads a matching ONNX Runtime and verifies its SHA-256
-checksum, caching it under `~/.cache/colgrep/onnxruntime/1.23.1/migraphx-rocm7.1.1`.
+checksum, caching it under `~/.cache/colgrep/onnxruntime/1.23.1/migraphx-rocm7.1.1-r4`
+(or beneath an absolute `XDG_CACHE_HOME`).
 A valid `ORT_DYLIB_PATH` overrides the managed runtime. CUDA is preferred when a
 visible NVIDIA device and cuDNN are available; otherwise visible AMD KFD devices
 select MIGraphX. `CUDA_VISIBLE_DEVICES`, `NVIDIA_VISIBLE_DEVICES`,
@@ -1005,6 +1006,28 @@ colgrep init --force-gpu /path/to/repo
 NEXT_PLAID_ORT_PROFILE=/tmp/colgrep-ort colgrep init --force-gpu /path/to/repo
 ```
 
-MIGraphX accelerates document and forced query encoding. Clustering and compression
+MIGraphX runs document and forced query encoding on the GPU. Clustering and compression
 use the CPU. Search queries use CPU by default in the Linux release; `--force-gpu`
 selects GPU query encoding. Existing precision settings still apply.
+
+For dynamic models with inline weights, the managed runtime caches compiled
+MIGraphX programs in
+`~/.cache/next-plaid/migraphx` (or beneath an absolute `XDG_CACHE_HOME`). The first run compiles
+each tensor shape; subsequent runs can reuse it even after an index is cleared.
+Compilation can make the first index much slower than CPU encoding, and a cached
+GPU run can still be slower than CPU encoding. Use `--force-cpu` to compare
+on your input.
+`NEXT_PLAID_MIGRAPHX_CACHE_DIR` selects another directory; an empty value disables
+this cache. External weights and calibrated models remain uncached. Nonquantized
+models can use explicit runtimes without cache support. Without a writable cache,
+changing tensor shapes recompiles programs. The cache has no size limit; remove
+its directory to reclaim disk space.
+
+The managed runtime also corrects MIGraphX 7.1.1 integer matrix multiplication
+with asymmetric zero points, keeping the selected INT8 model and correcting its
+zero-point arithmetic in INT32. Quantized MIGraphX builds require this correction,
+even when caching is disabled. An older explicit runtime produces an error when
+GPU execution is forced; Auto mode may fall back to CPU. Use the managed runtime,
+select FP32 with `colgrep settings --fp32`, or use `--force-cpu`. Matrix-multiply
+forms outside the correction's supported shapes use ONNX Runtime's CPU operator
+fallback.
