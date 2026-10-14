@@ -68,7 +68,7 @@ use tokenizers::Encoding;
 use tokenizers::Tokenizer;
 
 // Conditional imports for execution providers
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "migraphx"))]
 use ort::ep::ExecutionProvider as OrtExecutionProviderTrait;
 #[cfg(feature = "cuda")]
 use ort::execution_providers::CUDAExecutionProvider;
@@ -284,21 +284,16 @@ pub fn is_cuda_available() -> bool {
         return false;
     }
 
-    // Check if GPUs are visible via CUDA_VISIBLE_DEVICES FIRST
-    // This avoids triggering CUDA driver initialization when GPUs are hidden
-    //
-    // Note: When CUDA_VISIBLE_DEVICES is:
-    // - Not set: GPUs are visible (default CUDA behavior)
-    // - Empty string "": GPUs are hidden
-    // - "-1": GPUs are hidden
-    // - Valid device IDs: Only those GPUs are visible
-    if let Ok(devices) = std::env::var("CUDA_VISIBLE_DEVICES") {
-        // Empty string or "-1" means no GPUs visible
-        if devices.is_empty() || devices == "-1" {
-            return false;
-        }
+    // Check visibility before touching the CUDA driver.
+    if ["CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES"]
+        .iter()
+        .any(|key| {
+            std::env::var(key)
+                .is_ok_and(|v| v.trim().is_empty() || matches!(v.trim(), "-1" | "none" | "void"))
+        })
+    {
+        return false;
     }
-    // If CUDA_VISIBLE_DEVICES is not set, GPUs are visible by default
 
     // Try to check if CUDA EP is available, catching any panics from CUDA driver loading
     // This can panic if CUDA libraries are present but corrupted/incomplete (stub libraries)
@@ -320,79 +315,93 @@ pub fn is_cuda_available() -> bool {
     false
 }
 
-fn configure_auto_provider(builder: SessionBuilder) -> Result<SessionBuilder> {
-    if is_force_gpu() {
-        return configure_cuda(builder);
+/// Check that the requested provider can register with the loaded ONNX Runtime.
+/// This initializes the runtime once, so set ORT_DYLIB_PATH before calling it.
+pub fn validate_execution_provider(provider: ExecutionProvider) -> Result<()> {
+    init_ort_runtime();
+    let builder = Session::builder().context("Failed to create ONNX session options")?;
+    configure_execution_provider(builder, provider)?;
+    Ok(())
+}
+
+/// Whether the loaded runtime exposes MIGraphX and AMD devices are visible.
+pub fn is_migraphx_available() -> bool {
+    #[cfg(feature = "migraphx")]
+    {
+        if is_force_cpu()
+            || [
+                "HIP_VISIBLE_DEVICES",
+                "ROCR_VISIBLE_DEVICES",
+                "GPU_DEVICE_ORDINAL",
+            ]
+            .iter()
+            .any(|key| {
+                std::env::var(key).is_ok_and(|v| {
+                    v.trim().is_empty() || matches!(v.trim(), "-1" | "none" | "void")
+                })
+            })
+        {
+            return false;
+        }
+        init_ort_runtime();
+        MIGraphXExecutionProvider::default()
+            .is_available()
+            .unwrap_or(false)
     }
+    #[cfg(not(feature = "migraphx"))]
+    false
+}
 
-    // Skip GPU providers entirely if CPU-only mode is forced
-    #[cfg(any(
-        feature = "cuda",
-        feature = "tensorrt",
-        feature = "coreml",
-        feature = "directml",
-        feature = "migraphx"
-    ))]
-    let force_cpu = is_force_cpu();
-
+fn configure_auto_provider(builder: SessionBuilder) -> Result<SessionBuilder> {
+    if is_force_cpu() {
+        return Ok(builder);
+    }
+    #[allow(unused_mut)]
+    let mut errors: Vec<String> = Vec::new();
+    // Strict registration also matters in Auto mode: best-effort registration
+    // can return success after dropping the failed EP, hiding the next GPU.
     #[cfg(feature = "cuda")]
-    if !force_cpu {
-        // Wrap CUDA initialization in catch_cuda_panic to handle panics from stub libraries
-        // without printing the default panic message to stderr
-        let cuda_result = catch_cuda_panic(std::panic::AssertUnwindSafe(|| {
+    if is_cuda_available() {
+        match catch_cuda_panic(std::panic::AssertUnwindSafe(|| {
             builder
                 .clone()
-                .with_execution_providers([configured_cuda_execution_provider().build()])
-        }));
-        match cuda_result {
+                .with_execution_providers([configured_cuda_execution_provider()
+                    .build()
+                    .error_on_failure()])
+        })) {
             Ok(Ok(b)) => return Ok(b),
-            Ok(Err(_)) => { /* CUDA failed normally, try next provider */ }
-            Err(_) => {
-                eprintln!("[next-plaid-onnx] CUDA library found but missing required symbols (stub or incompatible driver). Using CPU.");
+            Ok(Err(e)) => errors.push(format!("CUDA: {e}")),
+            Err(_) => errors.push("CUDA: invalid or incomplete driver library".into()),
+        }
+    }
+    #[allow(unused_macros)]
+    macro_rules! attempt {
+        ($ep:expr, $name:expr) => {
+            match builder
+                .clone()
+                .with_execution_providers([$ep.error_on_failure()])
+            {
+                Ok(b) => return Ok(b),
+                Err(e) => errors.push(format!("{}: {e}", $name)),
             }
-        }
+        };
     }
-
     #[cfg(feature = "tensorrt")]
-    if !force_cpu {
-        if let Ok(b) = builder
-            .clone()
-            .with_execution_providers([TensorRTExecutionProvider::default().build()])
-        {
-            return Ok(b);
-        }
-    }
-
+    attempt!(TensorRTExecutionProvider::default().build(), "TensorRT");
     #[cfg(feature = "coreml")]
-    if !force_cpu {
-        if let Ok(b) = builder
-            .clone()
-            .with_execution_providers([coreml_execution_provider()])
-        {
-            return Ok(b);
-        }
-    }
-
+    attempt!(coreml_execution_provider(), "CoreML");
     #[cfg(feature = "directml")]
-    if !force_cpu {
-        if let Ok(b) = builder
-            .clone()
-            .with_execution_providers([DirectMLExecutionProvider::default().build()])
-        {
-            return Ok(b);
-        }
-    }
-
+    attempt!(DirectMLExecutionProvider::default().build(), "DirectML");
     #[cfg(feature = "migraphx")]
-    if !force_cpu {
-        if let Ok(b) = builder
-            .clone()
-            .with_execution_providers([MIGraphXExecutionProvider::default().build()])
-        {
-            return Ok(b);
+    if is_migraphx_available() {
+        match configure_migraphx(builder.clone()) {
+            Ok(b) => return Ok(b),
+            Err(error) => errors.push(format!("MIGraphX: {error:#}")),
         }
     }
-
+    if is_force_gpu() {
+        anyhow::bail!("No GPU execution provider could be registered. Ensure the GPU runtime and its dependencies are installed. {}", errors.join("; "));
+    }
     Ok(builder)
 }
 
@@ -534,13 +543,30 @@ fn configure_directml(_builder: SessionBuilder) -> Result<SessionBuilder> {
 }
 
 #[cfg(feature = "migraphx")]
-fn configure_migraphx(builder: SessionBuilder) -> Result<SessionBuilder> {
+fn configure_migraphx(mut builder: SessionBuilder) -> Result<SessionBuilder> {
+    use ort::AsPointer;
     if is_force_cpu() {
         return Ok(builder);
     }
-    builder
-        .with_execution_providers([MIGraphXExecutionProvider::default().build()])
-        .context("Failed to configure MIGraphX execution provider. Ensure ROCm and MIGraphX are installed.")
+    // ORT 1.23 changed the legacy OrtMIGraphXProviderOptions layout. ort rc.11
+    // still uses the old layout, so register through the stable generic API.
+    // Omitting legacy options also avoids serializing an empty cache path as `""`.
+    // https://github.com/microsoft/onnxruntime/blob/v1.23.1/onnxruntime/core/session/provider_registration.cc
+    let status = unsafe {
+        (ort::api().SessionOptionsAppendExecutionProvider)(
+            builder.ptr_mut(),
+            c"MIGraphX".as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        )
+    };
+    // Always propagate registration failure; ORT's best-effort EP dispatch
+    // would otherwise silently accept a CPU session after a failed GPU load.
+    unsafe { ort::error::status_to_result(status) }.context(
+        "Failed to configure MIGraphX execution provider. Ensure ROCm and MIGraphX are installed.",
+    )?;
+    Ok(builder)
 }
 
 #[cfg(not(feature = "migraphx"))]
@@ -706,7 +732,35 @@ const DEFAULT_CPU_BATCH_SIZE: usize = 32;
 /// Default batch size for GPU encoding.
 const DEFAULT_GPU_BATCH_SIZE: usize = 64;
 
-/// Type alias for batch encoding data: (input_ids, attention_mask, token_type_ids, token_ids)
+struct ProfiledSession {
+    session: Session,
+    profiling: bool,
+}
+
+impl std::ops::Deref for ProfiledSession {
+    type Target = Session;
+    fn deref(&self) -> &Session {
+        &self.session
+    }
+}
+
+impl std::ops::DerefMut for ProfiledSession {
+    fn deref_mut(&mut self) -> &mut Session {
+        &mut self.session
+    }
+}
+
+impl Drop for ProfiledSession {
+    fn drop(&mut self) {
+        if self.profiling {
+            match self.session.end_profiling() {
+                Ok(path) => eprintln!("[next-plaid-onnx] ORT profile: {path}"),
+                Err(e) => eprintln!("[next-plaid-onnx] Failed to finish ORT profile: {e}"),
+            }
+        }
+    }
+}
+
 /// ColBERT model for encoding documents and queries into multi-vector embeddings.
 ///
 /// Supports both single-session and parallel multi-session encoding.
@@ -729,7 +783,7 @@ const DEFAULT_GPU_BATCH_SIZE: usize = 64;
 /// ```
 #[derive(Clone)]
 pub struct Colbert {
-    sessions: Vec<Arc<Mutex<Session>>>,
+    sessions: Vec<Arc<Mutex<ProfiledSession>>>,
     tokenizer: Arc<Tokenizer>,
     config: Arc<ColbertConfig>,
     skiplist_ids: Arc<HashSet<u32>>,
@@ -1036,11 +1090,27 @@ impl ColbertBuilder {
 
             let builder = configure_execution_provider(builder, self.execution_provider)?;
 
+            let profile_prefix = std::env::var_os("NEXT_PLAID_ORT_PROFILE");
+            let builder = if let Some(prefix) = &profile_prefix {
+                builder
+                    .with_profiling(format!(
+                        "{}-{}-{}",
+                        std::path::PathBuf::from(prefix).display(),
+                        std::process::id(),
+                        _i
+                    ))
+                    .context("Failed to enable ONNX profiling")?
+            } else {
+                builder
+            };
             let session = builder
                 .commit_from_file(&onnx_path)
                 .context("Failed to load ONNX model")?;
 
-            sessions.push(Arc::new(Mutex::new(session)));
+            sessions.push(Arc::new(Mutex::new(ProfiledSession {
+                session,
+                profiling: profile_prefix.is_some(),
+            })));
         }
 
         // Determine batch size
@@ -2452,6 +2522,51 @@ fn pool_embeddings_hierarchical(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires a real CPU-only runtime via ORT_DYLIB_PATH; run in its own process"]
+    fn nonforced_explicit_cuda_allows_cpu_runtime() {
+        std::env::remove_var("NEXT_PLAID_FORCE_GPU");
+        std::env::remove_var("NEXT_PLAID_FORCE_CPU");
+        init_ort_runtime();
+        assert!(
+            configure_cuda(Session::builder().unwrap()).is_ok(),
+            "nonforced explicit CUDA lost its CPU fallback"
+        );
+    }
+
+    // Run in a separate process with a CPU-only ORT_DYLIB_PATH. Provider
+    // registration must reject a forced GPU rather than silently use the CPU.
+    #[cfg(feature = "migraphx")]
+    #[test]
+    #[ignore = "requires a real CPU-only ONNX Runtime via ORT_DYLIB_PATH"]
+    fn forced_migraphx_rejects_cpu_runtime() {
+        std::env::set_var("NEXT_PLAID_FORCE_GPU", "1");
+        init_ort_runtime();
+        let result = configure_migraphx(Session::builder().unwrap());
+        assert!(
+            result.is_err(),
+            "forced MIGraphX accepted a CPU-only runtime"
+        );
+    }
+
+    #[cfg(feature = "migraphx")]
+    #[test]
+    #[ignore = "requires a MIGraphX runtime, AMD GPU, and NEXT_PLAID_TEST_MODEL directory"]
+    fn forced_auto_encodes_with_migraphx() {
+        std::env::set_var("NEXT_PLAID_FORCE_GPU", "1");
+        let model_dir = std::env::var("NEXT_PLAID_TEST_MODEL").unwrap();
+        let model = Colbert::builder(model_dir)
+            .with_execution_provider(ExecutionProvider::Auto)
+            .with_quantized(true)
+            .build()
+            .unwrap();
+        let embeddings = model
+            .encode_documents(&["fn main() { println!(\"hello\"); }"], None)
+            .unwrap();
+        assert!(!embeddings.is_empty());
+    }
 
     // =========================================================================
     // ColbertConfig tests

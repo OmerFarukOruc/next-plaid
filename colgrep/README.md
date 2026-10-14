@@ -984,5 +984,27 @@ Advice for running on a CUDA 13 host:
   hit `CUDA_ERROR_UNSUPPORTED_PTX_VERSION`; put a NVRTC redistributable matching the
   **driver's** CUDA version first on `LD_LIBRARY_PATH`.
 - **Verify it's really on the GPU.** Run `colgrep init <repo> --force-gpu`. `--force-gpu`
-  hard-errors if the GPU path is unavailable, so a clean run means encoding and clustering
-  genuinely ran on the GPU (auto mode falls back to CPU silently).
+  hard-errors if the encoding provider cannot load. CUDA also accelerates clustering
+  and compression; AMD MIGraphX encoding uses CPU clustering and compression. Auto mode
+  permits CPU fallback.
+
+### AMD GPU encoding on Linux
+
+The Linux x86_64 release supports MIGraphX with ROCm 7.1.1. Install the ROCm and
+MIGraphX runtime packages for your distribution and expose their libraries to the
+dynamic linker. Colgrep downloads a matching ONNX Runtime and verifies its SHA-256
+checksum, caching it under `~/.cache/colgrep/onnxruntime/1.23.1/migraphx-rocm7.1.1`.
+A valid `ORT_DYLIB_PATH` overrides the managed runtime. CUDA is preferred when a
+visible NVIDIA device and cuDNN are available; otherwise visible AMD KFD devices
+select MIGraphX. `CUDA_VISIBLE_DEVICES`, `NVIDIA_VISIBLE_DEVICES`,
+`HIP_VISIBLE_DEVICES`, `ROCR_VISIBLE_DEVICES`, and `GPU_DEVICE_ORDINAL` can hide devices.
+
+```sh
+colgrep init --force-gpu /path/to/repo
+# Optional inference diagnostic. ORT writes a JSON profile when the session closes.
+NEXT_PLAID_ORT_PROFILE=/tmp/colgrep-ort colgrep init --force-gpu /path/to/repo
+```
+
+MIGraphX accelerates document and forced query encoding. Clustering and compression
+use the CPU. Search queries use CPU by default in the Linux release; `--force-gpu`
+selects GPU query encoding. Existing precision settings still apply.
